@@ -1,0 +1,12 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+logs/
+Vault/
+
+data/config.json
+data/vault.dat
+data/vault.tmp
+data/vault.bak
