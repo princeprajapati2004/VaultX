@@ -1,258 +1,289 @@
-"""Vault lock, unlock, and recovery logic for VaultX."""
+"""Per-file vault lock, unlock, and recovery operations for VaultX."""
 
 from __future__ import annotations
 
 import logging
 import shutil
 import time
+import uuid
+from pathlib import Path
 
-from cryptography.fernet import InvalidToken
-
-from archive import bytes_to_folder, folder_to_bytes, is_valid_zip_bytes
-from config import get_salt, verify_password
 from constants import (
     BACKUP_CREATED,
+    BACKUP_DIR,
     BACKUP_REMOVED,
     BACKUP_RESTORED,
-    BACKUP_VAULT_FILE,
-    LOCKED_MESSAGE,
     LOCK_FAILED,
+    LOCKED_MESSAGE,
+    MAX_FILE_SIZE,
     NO_VAULT_FOUND,
     RECOVERY_COMPLETE,
     RECOVERY_FAILED,
-    TEMP_FILE_MISSING,
-    TEMP_VAULT_FILE,
+    TEMP_DIR,
     TEMP_FILE_DELETED,
-    UNLOCKED_MESSAGE,
+    TEMP_FILE_MISSING,
     UNLOCK_FAILED,
+    UNLOCKED_MESSAGE,
     VAULT_ALREADY_UNLOCKED,
     VAULT_DIR,
-    VAULT_FILE,
     VAULT_FOLDER_NOT_FOUND,
     WRONG_PASSWORD_OR_CORRUPTED,
+    VAULT_CONTAINER_FILE,
 )
-from exceptions import CorruptedVault, InvalidPassword, VaultLocked, VaultNotFound, VaultUnlocked
-from crypto import decrypt_bytes, encrypt_bytes
+from exceptions import (
+    CorruptedVault,
+    FileTooLarge,
+    InvalidPassword,
+    MetadataCorrupted,
+    VaultNotFound,
+    VaultUnlocked,
+)
+from metadata import (
+    FileRecord,
+    VaultMetadata,
+    build_file_record,
+    load_metadata,
+    save_metadata,
+)
+from password_manager import PasswordManager
+from streaming import decrypt_file, encrypt_file, should_compress
 
 LOGGER = logging.getLogger(__name__)
 
-_FAILED_ATTEMPTS = {}
+_FAILED_ATTEMPTS: dict[str, tuple[float, int]] = {}
 _LOCKOUT_DURATION = 30
 
 
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+
 def _check_rate_limit(attempt_key: str = "unlock") -> None:
-    """Enforce rate limiting on failed authentication attempts."""
-
+    """Enforce brute-force rate limiting on failed authentication attempts."""
     now = time.time()
-
     if attempt_key in _FAILED_ATTEMPTS:
         failed_time, count = _FAILED_ATTEMPTS[attempt_key]
         elapsed = now - failed_time
-
         if count >= 5 and elapsed < _LOCKOUT_DURATION:
-            raise InvalidPassword(f"Too many failed attempts. Try again in {int(_LOCKOUT_DURATION - elapsed)} seconds.")
-
+            remaining = int(_LOCKOUT_DURATION - elapsed)
+            raise InvalidPassword(
+                f"Too many failed attempts. Try again in {remaining} seconds."
+            )
         if elapsed >= _LOCKOUT_DURATION:
             del _FAILED_ATTEMPTS[attempt_key]
-
-    _FAILED_ATTEMPTS[attempt_key] = (now, _FAILED_ATTEMPTS.get(attempt_key, (now, 0))[1] + 1)
+    current_count = _FAILED_ATTEMPTS.get(attempt_key, (now, 0))[1]
+    _FAILED_ATTEMPTS[attempt_key] = (now, current_count + 1)
 
 
 def _reset_rate_limit(attempt_key: str = "unlock") -> None:
-    """Clear failed attempt tracking on successful authentication."""
+    """Clear the rate-limit counter after a successful authentication."""
+    _FAILED_ATTEMPTS.pop(attempt_key, None)
 
-    if attempt_key in _FAILED_ATTEMPTS:
-        del _FAILED_ATTEMPTS[attempt_key]
 
+# ── State queries ─────────────────────────────────────────────────────────────
 
 def vault_exists() -> bool:
-    """Return True when the encrypted vault file exists."""
-
-    return VAULT_FILE.exists()
+    """Return True when the vault container exists (Private.vxdb present)."""
+    return VAULT_CONTAINER_FILE.exists()
 
 
 def unlocked() -> bool:
-    """Return True when the vault folder is currently available."""
-
+    """Return True when the plaintext Vault/ working directory exists."""
     return VAULT_DIR.exists()
 
 
 def recovery_pending() -> bool:
-    """Return True when a temporary vault file exists."""
+    """Return True when temp .vx files from an interrupted lock remain."""
+    return TEMP_DIR.exists() and any(TEMP_DIR.glob("*.vx"))
 
-    return TEMP_VAULT_FILE.exists()
 
+# ── Cleanup helpers ───────────────────────────────────────────────────────────
 
 def delete_temporary_vault() -> None:
-    """Delete the temporary vault file if one exists."""
-
-    if TEMP_VAULT_FILE.exists():
-        TEMP_VAULT_FILE.unlink()
-        LOGGER.info(TEMP_FILE_DELETED)
+    """Delete any .vx temp files left from an interrupted lock operation."""
+    if not TEMP_DIR.exists():
+        return
+    for f in TEMP_DIR.glob("*.vx"):
+        f.unlink(missing_ok=True)
+    LOGGER.info(TEMP_FILE_DELETED)
 
 
 def restore_backup_vault() -> None:
-    """Restore or clean up the backup vault file."""
+    """
+    Restore encrypted files from backup when the encrypted directory is empty.
 
-    if not BACKUP_VAULT_FILE.exists():
+    Called at startup to recover from a crash during a lock operation after
+    the original .vx files were moved to backup but before the new ones committed.
+    """
+    if not BACKUP_DIR.exists():
+        return
+    backup_files = list(BACKUP_DIR.glob("*.vx"))
+    if not backup_files:
         return
 
-    if vault_exists():
-        BACKUP_VAULT_FILE.unlink()
+    encrypted_has_files = ENCRYPTED_DIR.exists() and any(ENCRYPTED_DIR.glob("*.vx"))
+    if encrypted_has_files:
+        for f in backup_files:
+            f.unlink(missing_ok=True)
         LOGGER.info(BACKUP_REMOVED)
         return
 
-    BACKUP_VAULT_FILE.replace(VAULT_FILE)
+    ENCRYPTED_DIR.mkdir(parents=True, exist_ok=True)
+    for f in backup_files:
+        f.replace(ENCRYPTED_DIR / f.name)
     LOGGER.info(BACKUP_RESTORED)
 
 
-def _ensure_data_dir() -> None:
-    """Create the data directory if required."""
-
-    VAULT_FILE.parent.mkdir(parents=True, exist_ok=True)
-
-
-def _verify_encrypted_archive(encrypted_blob: bytes, password: str) -> bytes:
-    """Decrypt and validate encrypted vault bytes in memory."""
-
-    try:
-        decrypted = decrypt_bytes(encrypted_blob, password, get_salt())
-    except InvalidToken as exc:
-        raise InvalidPassword(WRONG_PASSWORD_OR_CORRUPTED) from exc
-
-    if not is_valid_zip_bytes(decrypted):
-        raise CorruptedVault(WRONG_PASSWORD_OR_CORRUPTED)
-
-    return decrypted
-
-
-def recover_temporary_vault() -> None:
-    """Recover a previously interrupted lock operation."""
-
-    if not TEMP_VAULT_FILE.exists():
-        raise VaultNotFound(TEMP_FILE_MISSING)
-
-    try:
-        temp_blob = TEMP_VAULT_FILE.read_bytes()
-        if not temp_blob:
-            raise CorruptedVault(TEMP_FILE_MISSING)
-
-        if VAULT_FILE.exists() and not BACKUP_VAULT_FILE.exists():
-            VAULT_FILE.replace(BACKUP_VAULT_FILE)
-            LOGGER.info(BACKUP_CREATED)
-
-        TEMP_VAULT_FILE.replace(VAULT_FILE)
-
-        if not VAULT_FILE.exists() or VAULT_FILE.stat().st_size == 0:
-            raise CorruptedVault(RECOVERY_FAILED)
-
-        if BACKUP_VAULT_FILE.exists():
-            BACKUP_VAULT_FILE.unlink()
-            LOGGER.info(BACKUP_REMOVED)
-
-        LOGGER.info(RECOVERY_COMPLETE)
-
-    except Exception as exc:
-        LOGGER.error(RECOVERY_FAILED, exc)
-
-        if BACKUP_VAULT_FILE.exists():
-            BACKUP_VAULT_FILE.replace(VAULT_FILE)
-            LOGGER.info(BACKUP_RESTORED)
-
-        raise
-
+# ── Lock ──────────────────────────────────────────────────────────────────────
 
 def lock_vault(password: str) -> None:
-    """Archive and encrypt the vault folder."""
+    """
+    Encrypt each file in Vault/ as a separate .vx object in Encrypted/.
 
+    Per-file pipeline:
+      validate → size check → extension policy → generate ID → encrypt (streaming)
+      → verify → commit → update metadata → delete Vault/
+
+    Atomic: all new .vx files land in temp/ first, then are committed together.
+    Existing encrypted files are backed up before the commit and restored on failure.
+    """
     if not unlocked():
         raise VaultNotFound(VAULT_FOLDER_NOT_FOUND)
 
-    _ensure_data_dir()
-    backup_created = False
+    # Unlock vault container to get Master Encryption Key
+    pm = PasswordManager(VAULT_CONTAINER_FILE)
+    if not pm.unlock_vault(password):
+        raise InvalidPassword(WRONG_PASSWORD_OR_CORRUPTED)
+
+    master_key = pm.get_mek()
+    if not master_key:
+        raise InvalidPassword(WRONG_PASSWORD_OR_CORRUPTED)
+    for d in (ENCRYPTED_DIR, TEMP_DIR, BACKUP_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+
+    plaintext_files = [f for f in VAULT_DIR.rglob("*") if f.is_file()]
+    meta = VaultMetadata()
+    temp_written: list[Path] = []
+    backup_moved: list[Path] = []
 
     try:
-        LOGGER.info("Creating archive.")
-        data = folder_to_bytes(VAULT_DIR)
+        # ── Phase 1: validate and encrypt every file to TEMP_DIR ─────────────
+        for file_path in plaintext_files:
+            size = file_path.stat().st_size
+            if size > MAX_FILE_SIZE:
+                raise FileTooLarge(
+                    f"'{file_path.name}' is {size // (1024*1024)} MB "
+                    f"and exceeds the 150 MB limit."
+                )
 
-        LOGGER.info("Encrypting.")
-        encrypted = encrypt_bytes(data, password, get_salt())
-        TEMP_VAULT_FILE.write_bytes(encrypted)
+            file_id = str(uuid.uuid4())
+            temp_path = TEMP_DIR / f"{file_id}.vx"
+            compress = should_compress(file_path)
 
-        if not TEMP_VAULT_FILE.exists() or TEMP_VAULT_FILE.stat().st_size == 0:
-            raise CorruptedVault(TEMP_FILE_MISSING)
+            LOGGER.info("Encrypting: %s", file_path.name)
+            sha256_hex, was_compressed = encrypt_file(
+                file_path, temp_path, master_key, file_id, compress=compress
+            )
+            temp_written.append(temp_path)
 
-        _verify_encrypted_archive(TEMP_VAULT_FILE.read_bytes(), password)
+            record = build_file_record(
+                file_id=file_id,
+                original_name=file_path.name,
+                plaintext_path=file_path,
+                sha256=sha256_hex,
+                compressed=was_compressed,
+            )
+            meta.add_file(record)
 
-        if VAULT_FILE.exists():
-            if BACKUP_VAULT_FILE.exists():
-                BACKUP_VAULT_FILE.unlink()
-
+        # ── Phase 2: back up existing encrypted files ────────────────────────
+        for existing in ENCRYPTED_DIR.glob("*.vx"):
+            existing.replace(BACKUP_DIR / existing.name)
+            backup_moved.append(BACKUP_DIR / existing.name)
+        if backup_moved:
             LOGGER.info(BACKUP_CREATED)
-            VAULT_FILE.replace(BACKUP_VAULT_FILE)
-            backup_created = True
 
-        TEMP_VAULT_FILE.replace(VAULT_FILE)
-        _verify_encrypted_archive(VAULT_FILE.read_bytes(), password)
+        # ── Phase 3: commit temp files → encrypted dir ───────────────────────
+        for temp_path in temp_written:
+            temp_path.replace(ENCRYPTED_DIR / temp_path.name)
+        temp_written.clear()
 
-        if BACKUP_VAULT_FILE.exists():
-            BACKUP_VAULT_FILE.unlink()
-            LOGGER.info(BACKUP_REMOVED)
+        # ── Phase 4: write encrypted metadata ───────────────────────────────
+        save_metadata(meta, master_key)
+
+        # ── Phase 5: clean up backup and Vault/ ──────────────────────────────
+        for bak in backup_moved:
+            bak.unlink(missing_ok=True)
+        LOGGER.info(BACKUP_REMOVED)
 
         shutil.rmtree(VAULT_DIR)
         LOGGER.info(LOCKED_MESSAGE)
 
-    except InvalidPassword:
-        LOGGER.error(WRONG_PASSWORD_OR_CORRUPTED)
-        if TEMP_VAULT_FILE.exists():
-            TEMP_VAULT_FILE.unlink()
-        if backup_created and BACKUP_VAULT_FILE.exists():
-            BACKUP_VAULT_FILE.replace(VAULT_FILE)
-            LOGGER.info(BACKUP_RESTORED)
-        raise
-
-    except (CorruptedVault, VaultNotFound, VaultLocked) as exc:
-        LOGGER.error(LOCK_FAILED, exc)
-        if TEMP_VAULT_FILE.exists():
-            TEMP_VAULT_FILE.unlink()
-        if backup_created and BACKUP_VAULT_FILE.exists():
-            BACKUP_VAULT_FILE.replace(VAULT_FILE)
-            LOGGER.info(BACKUP_RESTORED)
-        raise
-
     except Exception as exc:
         LOGGER.error(LOCK_FAILED, exc)
-        if TEMP_VAULT_FILE.exists():
-            TEMP_VAULT_FILE.unlink()
-        if backup_created and BACKUP_VAULT_FILE.exists():
-            BACKUP_VAULT_FILE.replace(VAULT_FILE)
+        # Rollback: remove any temp files not yet committed
+        for tp in temp_written:
+            tp.unlink(missing_ok=True)
+        # Restore backup if we already moved the original encrypted files
+        if backup_moved and not any(ENCRYPTED_DIR.glob("*.vx")):
+            for bak in backup_moved:
+                if bak.exists():
+                    bak.replace(ENCRYPTED_DIR / bak.name)
             LOGGER.info(BACKUP_RESTORED)
         raise
 
 
-def unlock_vault(password: str) -> None:
-    """Decrypt and restore the vault folder from disk."""
+# ── Unlock ────────────────────────────────────────────────────────────────────
 
+def unlock_vault(password: str) -> None:
+    """
+    Decrypt all .vx files from Encrypted/ into Vault/.
+
+    Verifies:
+      • password via MEK decryption (constant-time)
+      • metadata AEAD authentication tag
+      • each file's per-chunk Poly1305 tag
+      • each file's SHA-256 checksum against metadata
+
+    On any verification failure the partially-extracted Vault/ is removed.
+    """
     if unlocked():
         raise VaultUnlocked(VAULT_ALREADY_UNLOCKED)
-
     if not vault_exists():
         raise VaultNotFound(NO_VAULT_FOUND)
 
     try:
         _check_rate_limit("unlock")
 
-        if not verify_password(password):
+        # Unlock vault container to get Master Encryption Key
+        pm = PasswordManager(VAULT_CONTAINER_FILE)
+        if not pm.unlock_vault(password):
             raise InvalidPassword(WRONG_PASSWORD_OR_CORRUPTED)
 
-        encrypted = VAULT_FILE.read_bytes()
-        LOGGER.info("Decrypting.")
-        decrypted = _verify_encrypted_archive(encrypted, password)
+        master_key = pm.get_mek()
+        if not master_key:
+            raise InvalidPassword(WRONG_PASSWORD_OR_CORRUPTED)
 
-        VAULT_DIR.mkdir(parents=True, exist_ok=False)
+        LOGGER.info("Verifying metadata.")
+        meta = load_metadata(master_key)
+
+        VAULT_DIR.mkdir(parents=True, exist_ok=True)
 
         try:
-            bytes_to_folder(decrypted, VAULT_DIR)
+            for file_id, record in meta.files.items():
+                vx_path = ENCRYPTED_DIR / record.encrypted_name
+                if not vx_path.exists():
+                    raise VaultNotFound(
+                        f"Encrypted file missing from vault: {record.encrypted_name}"
+                    )
+
+                dest_path = _unique_path(VAULT_DIR / record.original_name)
+                LOGGER.info("Decrypting: %s", record.original_name)
+                decrypt_file(
+                    vx_path,
+                    dest_path,
+                    master_key,
+                    file_id,
+                    expected_sha256=record.sha256,
+                )
+
         except Exception as exc:
             if VAULT_DIR.exists():
                 shutil.rmtree(VAULT_DIR)
@@ -261,12 +292,45 @@ def unlock_vault(password: str) -> None:
         _reset_rate_limit("unlock")
         LOGGER.info(UNLOCKED_MESSAGE)
 
-    except (InvalidPassword, CorruptedVault) as exc:
+    except (InvalidPassword, CorruptedVault, MetadataCorrupted) as exc:
         LOGGER.error(str(exc))
         raise
-
     except Exception as exc:
         LOGGER.error(UNLOCK_FAILED, exc)
         if VAULT_DIR.exists():
             shutil.rmtree(VAULT_DIR)
         raise
+
+
+# ── Recovery ──────────────────────────────────────────────────────────────────
+
+def recover_temporary_vault() -> None:
+    """
+    Recover from an interrupted lock by promoting .vx temp files to encrypted/.
+
+    Called when the app detects recovery_pending() is True at startup.
+    """
+    if not recovery_pending():
+        raise VaultNotFound(TEMP_FILE_MISSING)
+    try:
+        ENCRYPTED_DIR.mkdir(parents=True, exist_ok=True)
+        for temp_file in TEMP_DIR.glob("*.vx"):
+            temp_file.replace(ENCRYPTED_DIR / temp_file.name)
+        LOGGER.info(RECOVERY_COMPLETE)
+    except Exception as exc:
+        LOGGER.error(RECOVERY_FAILED, exc)
+        raise
+
+
+# ── Internal helpers ──────────────────────────────────────────────────────────
+
+def _unique_path(path: Path) -> Path:
+    """Return *path* unchanged if it does not exist, otherwise append _N suffix."""
+    if not path.exists():
+        return path
+    counter = 1
+    while True:
+        candidate = path.with_name(f"{path.stem}_{counter}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+        counter += 1

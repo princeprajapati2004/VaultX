@@ -65,13 +65,22 @@ db.sqlite3-journal
 instance/
 .webassets-cache
 
-# VaultX runtime data
-logs/
+# VaultX runtime data (v4)
+Private.vxdb
+Encrypted/
 Vault/
-data/config.json
-data/vault.dat
-data/vault.tmp
-data/vault.bak
+logs/
+
+# VaultX legacy runtime data (v2-v3, kept for migration)
+VaultData/
+data/
+*.dat
+*.bak
+*.tmp
+.secrets/
+*.key
+*.cert
+*.pem
 
 # Scrapy stuff:
 .scrapy

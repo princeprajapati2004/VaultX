@@ -11,15 +11,15 @@ from tkinter import BooleanVar, TclError
 
 import customtkinter as ctk
 
-from config import CONFIG_FILE, DATA_DIR
+from config import is_legacy_vault, save_new_password
 from constants import (
     APP_VERSION,
-    BACKUP_VAULT_FILE,
     CREATE_NEW_VAULT_MESSAGE,
     CREATE_PASSWORD_PROMPT,
     CONFIRM_PASSWORD_PROMPT,
     DELETE_TEMP_OPTION,
     ENTER_TO_CONTINUE_PROMPT,
+    LEGACY_VAULT_DETECTED,
     LOCK_VAULT_MESSAGE,
     LOG_DIR,
     LOG_FILE,
@@ -39,17 +39,28 @@ from constants import (
     STARTUP_MESSAGE,
     TEMP_FILE_DELETED,
     TEMP_FILE_MISSING,
-    TEMP_VAULT_FILE,
-    UNLOCKED_MESSAGE,
     UNLOCK_VAULT_MESSAGE,
+    UNLOCKED_MESSAGE,
     VAULT_ALREADY_UNLOCKED,
     VAULT_CREATION_FAILED,
+    VAULT_CONTAINER_FILE,
+    ENCRYPTED_DIR,
     VAULT_DIR,
-    VAULT_FILE,
     VAULT_FOLDER_NOT_FOUND,
     WRONG_PASSWORD_OR_CORRUPTED,
 )
-from exceptions import CorruptedVault, InvalidPassword, VaultError, VaultLocked, VaultNotFound, VaultUnlocked
+from exceptions import (
+    CorruptedVault,
+    FileTooLarge,
+    InvalidPassword,
+    LegacyVaultDetected,
+    MetadataCorrupted,
+    UnsupportedFile,
+    VaultError,
+    VaultLocked,
+    VaultNotFound,
+    VaultUnlocked,
+)
 from vault import (
     delete_temporary_vault,
     lock_vault,
@@ -60,7 +71,6 @@ from vault import (
     unlocked,
     vault_exists,
 )
-from config import save_new_password
 from file_import import import_files, validate_file_safety
 
 BG = "#040607"
@@ -292,7 +302,7 @@ class VaultXApp(ctk.CTk):
         self._startup_index = 0
         self._startup_lines = [
             "Initializing VaultX...",
-            "Loading Encryption Engine...",
+            "Loading Argon2id + XChaCha20-Poly1305...",
             "Checking Vault...",
             "Ready.",
         ]
@@ -400,12 +410,16 @@ class VaultXApp(ctk.CTk):
     def _bootstrap_state(self) -> None:
         """Handle startup state and show the appropriate screen."""
 
+        if is_legacy_vault():
+            self._show_legacy_notice()
+            return
+
         restore_backup_vault()
 
         if recovery_pending():
             self._show_recovery_dialog()
 
-        if not CONFIG_FILE.exists():
+        if not VAULT_CONTAINER_FILE.exists():
             self._show_welcome_screen()
             return
 
@@ -418,6 +432,59 @@ class VaultXApp(ctk.CTk):
             return
 
         self._show_login_screen(error_message=NO_VAULT_FOUND)
+
+    def _show_legacy_notice(self) -> None:
+        """Render a migration notice when a legacy v2 vault is detected."""
+
+        frame = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
+        self._set_view(frame)
+
+        card = ctk.CTkFrame(
+            frame,
+            fg_color=PANEL,
+            corner_radius=18,
+            border_width=1,
+            border_color=BORDER,
+        )
+        card.place(relx=0.5, rely=0.5, anchor="center", relwidth=0.60, relheight=0.58)
+
+        title = ctk.CTkLabel(
+            card,
+            text="VaultX",
+            text_color=ACCENT,
+            font=("Consolas", 28, "bold"),
+        )
+        title.pack(pady=(32, 4))
+
+        subtitle = ctk.CTkLabel(
+            card,
+            text="Legacy Vault Detected",
+            text_color=ERROR,
+            font=("Consolas", 18, "bold"),
+        )
+        subtitle.pack(pady=(0, 16))
+
+        message = ctk.CTkLabel(
+            card,
+            text=LEGACY_VAULT_DETECTED,
+            text_color=MUTED,
+            font=("Consolas", 11),
+            justify="center",
+            wraplength=460,
+        )
+        message.pack(pady=(0, 24), padx=36)
+
+        button = ctk.CTkButton(
+            card,
+            text="Create New Vault (fresh start)",
+            fg_color=ACCENT_2,
+            hover_color=ACCENT,
+            text_color="#00130D",
+            font=self._accent_font,
+            height=40,
+            command=self._show_welcome_screen,
+        )
+        button.pack(fill="x", padx=36)
 
     def _show_welcome_screen(self) -> None:
         """Render the first-time setup welcome screen."""
@@ -869,8 +936,12 @@ class VaultXApp(ctk.CTk):
     def _handle_unlock_error(self, exc: Exception) -> None:
         """Display a login error after a failed unlock attempt."""
 
-        if isinstance(exc, (InvalidPassword, CorruptedVault, VaultNotFound, VaultUnlocked)):
-            message = "Invalid password."
+        if isinstance(exc, (InvalidPassword, CorruptedVault, MetadataCorrupted)):
+            message = "Invalid password or corrupted vault."
+        elif isinstance(exc, VaultNotFound):
+            message = "No vault found."
+        elif isinstance(exc, VaultUnlocked):
+            message = "Vault is already unlocked."
         else:
             message = "Unable to unlock vault."
 
@@ -920,7 +991,7 @@ class VaultXApp(ctk.CTk):
 
         right = ctk.CTkLabel(
             header,
-            text=f"{VAULT_DIR}",
+            text=f"{VAULT_CONTAINER_FILE.parent}",
             text_color=TEXT,
             font=("Consolas", 11),
         )
@@ -1130,7 +1201,9 @@ class VaultXApp(ctk.CTk):
     def _handle_lock_error(self, exc: Exception) -> None:
         """Display a lock error message."""
 
-        if isinstance(exc, (VaultLocked, VaultNotFound, CorruptedVault)):
+        if isinstance(exc, (VaultLocked, VaultNotFound, CorruptedVault, FileTooLarge)):
+            message = str(exc)
+        elif isinstance(exc, UnsupportedFile):
             message = str(exc)
         else:
             message = "Unable to lock vault."
@@ -1161,17 +1234,25 @@ class VaultXApp(ctk.CTk):
         )
 
     def _change_password(self, new_password: str) -> None:
-        """Re-encrypt the vault using a new password."""
+        """Change the vault password without re-encrypting files (v4 instant change)."""
+        from password_manager import PasswordManager
 
-        old_config = CONFIG_FILE.read_text(encoding="utf-8") if CONFIG_FILE.exists() else ""
-        try:
-            save_new_password(new_password)
-            lock_vault(new_password)
-            unlock_vault(new_password)
-        except Exception:
-            if old_config:
-                CONFIG_FILE.write_text(old_config, encoding="utf-8")
-            raise
+        # Prompt for current password to verify identity
+        dialog = PromptDialog(
+            self,
+            title="Verify Password",
+            label="Enter current password",
+            show_confirm=False,
+        )
+        if not isinstance(dialog.result, str):
+            raise ValueError("Password change cancelled")
+
+        old_password = dialog.result
+
+        # Perform instant password change (no file re-encryption needed)
+        pm = PasswordManager(VAULT_CONTAINER_FILE)
+        if not pm.change_password(old_password, new_password):
+            raise ValueError("Current password is incorrect")
 
     def _handle_password_change_error(self, exc: Exception) -> None:
         """Report password update failures."""
@@ -1257,11 +1338,22 @@ class VaultXApp(ctk.CTk):
                 return
 
             dialog.destroy()
+
+            def _on_import_error(exc: Exception) -> None:
+                if isinstance(exc, FileTooLarge):
+                    self._append_terminal_line(f"Import blocked: {exc}")
+                elif isinstance(exc, UnsupportedFile):
+                    self._append_terminal_line(f"Import blocked: {exc}")
+                elif isinstance(exc, InvalidPassword):
+                    self._append_terminal_line("Import failed: invalid password.")
+                else:
+                    self._append_terminal_line(f"Import failed: {exc}")
+
             self._run_backend_operation(
                 status_text="Importing files...",
                 task=lambda: import_files([file_path], self._session_password or ""),
                 success_callback=lambda: self._append_terminal_line("Files imported successfully."),
-                error_callback=lambda exc: self._append_terminal_line(f"Import failed: {exc}"),
+                error_callback=_on_import_error,
             )
 
         button_row = ctk.CTkFrame(container, fg_color=PANEL)
