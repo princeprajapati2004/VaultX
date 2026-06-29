@@ -419,7 +419,18 @@ class VaultXApp(ctk.CTk):
         if recovery_pending():
             self._show_recovery_dialog()
 
-        if not VAULT_CONTAINER_FILE.exists():
+        # Check if vault file exists and is valid
+        vault_file_exists = False
+        if VAULT_CONTAINER_FILE.exists():
+            try:
+                # Try to read the vault file header to verify it's valid
+                data = VAULT_CONTAINER_FILE.read_bytes()
+                if len(data) >= 8 and data[:4] == b"VXDB":
+                    vault_file_exists = True
+            except Exception:
+                pass
+
+        if not vault_file_exists:
             self._show_welcome_screen()
             return
 
