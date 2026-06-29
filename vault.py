@@ -37,7 +37,7 @@ from crypto import decrypt_bytes, encrypt_bytes
 LOGGER = logging.getLogger(__name__)
 
 _FAILED_ATTEMPTS = {}
-_LOCKOUT_DURATION = 5
+_LOCKOUT_DURATION = 30
 
 
 def _check_rate_limit(attempt_key: str = "unlock") -> None:

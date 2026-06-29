@@ -61,6 +61,7 @@ from vault import (
     vault_exists,
 )
 from config import save_new_password
+from file_import import import_files, validate_file_safety
 
 BG = "#040607"
 PANEL = "#0A0F10"
@@ -1050,6 +1051,10 @@ class VaultXApp(ctk.CTk):
             self._request_password_change()
             return
 
+        if command_name == "import":
+            self._request_file_import()
+            return
+
         if command_name == "exit":
             self._close()
             return
@@ -1064,6 +1069,7 @@ class VaultXApp(ctk.CTk):
         self._append_terminal_line("  lock   Lock the vault")
         self._append_terminal_line("  status Show vault status")
         self._append_terminal_line("  passwd Change the master password")
+        self._append_terminal_line("  import Add files to vault")
         self._append_terminal_line("  help   Show this help")
         self._append_terminal_line("  clear  Clear the terminal")
         self._append_terminal_line("  exit   Close VaultX")
@@ -1179,6 +1185,114 @@ class VaultXApp(ctk.CTk):
             self._show_terminal_screen()
         else:
             self._show_login_screen(error_message="Password updated. Unlock with the new password.")
+
+    def _request_file_import(self) -> None:
+        """Prompt for file path and import to vault."""
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Import Files to Vault")
+        dialog.geometry("500x280")
+        dialog.resizable(False, False)
+        dialog.configure(fg_color=PANEL)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        container = ctk.CTkFrame(dialog, fg_color=PANEL, corner_radius=0)
+        container.pack(fill="both", expand=True, padx=20, pady=20)
+
+        title = ctk.CTkLabel(
+            container,
+            text="Import Files to Vault",
+            text_color=ACCENT,
+            font=("Consolas", 16, "bold"),
+        )
+        title.pack(anchor="w", pady=(0, 10))
+
+        info = ctk.CTkLabel(
+            container,
+            text="Enter the full path to a file or folder to add to your vault.",
+            text_color=MUTED,
+            font=("Consolas", 11),
+            wraplength=420,
+            justify="left",
+        )
+        info.pack(anchor="w", pady=(0, 12))
+
+        label = ctk.CTkLabel(
+            container,
+            text="File/Folder Path",
+            text_color=MUTED,
+            font=("Consolas", 11),
+        )
+        label.pack(anchor="w", pady=(0, 6))
+
+        path_entry = ctk.CTkEntry(
+            container,
+            height=36,
+            fg_color=PANEL_2,
+            border_color=BORDER,
+            text_color=TEXT,
+            font=("Consolas", 11),
+        )
+        path_entry.pack(fill="x", pady=(0, 14))
+        path_entry.focus_set()
+
+        error_label = ctk.CTkLabel(
+            container,
+            text="",
+            text_color=ERROR,
+            font=("Consolas", 10),
+        )
+        error_label.pack(anchor="w", pady=(0, 12))
+
+        def import_file() -> None:
+            file_path = path_entry.get().strip()
+            if not file_path:
+                error_label.configure(text="Please enter a file or folder path.", text_color=ERROR)
+                return
+
+            is_safe, reason = validate_file_safety(file_path)
+            if not is_safe:
+                error_label.configure(text=f"Invalid: {reason}", text_color=ERROR)
+                return
+
+            dialog.destroy()
+            self._run_backend_operation(
+                status_text="Importing files...",
+                task=lambda: import_files([file_path], self._session_password or ""),
+                success_callback=lambda: self._append_terminal_line("Files imported successfully."),
+                error_callback=lambda exc: self._append_terminal_line(f"Import failed: {exc}"),
+            )
+
+        button_row = ctk.CTkFrame(container, fg_color=PANEL)
+        button_row.pack(fill="x", pady=(4, 0))
+
+        cancel_button = ctk.CTkButton(
+            button_row,
+            text="Cancel",
+            fg_color="#1A2423",
+            hover_color="#213230",
+            text_color=TEXT,
+            font=("Consolas", 11),
+            width=110,
+            command=dialog.destroy,
+        )
+        cancel_button.pack(side="right", padx=(10, 0))
+
+        import_button = ctk.CTkButton(
+            button_row,
+            text="Import",
+            fg_color=ACCENT_2,
+            hover_color=ACCENT,
+            text_color="#00130D",
+            font=("Consolas", 11, "bold"),
+            width=110,
+            command=import_file,
+        )
+        import_button.pack(side="right")
+
+        path_entry.bind("<Return>", lambda _event: import_file())
+        dialog.wait_window()
 
     def _run_backend_operation(
         self,
