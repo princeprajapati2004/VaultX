@@ -1,4 +1,6 @@
+argon2-cffi
 cryptography
 customtkinter
 psutil
+pynacl
 watchdog

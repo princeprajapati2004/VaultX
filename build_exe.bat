@@ -8,6 +8,9 @@ echo VaultX Executable Builder
 echo ================================
 echo.
 
+REM Activate virtual environment
+call .venv\Scripts\activate.bat
+
 REM Check if PyInstaller is installed
 pip show pyinstaller >nul 2>&1
 if errorlevel 1 (
@@ -16,6 +19,7 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+
 
 echo Cleaning previous builds...
 if exist "dist\" rmdir /s /q dist >nul 2>&1
@@ -30,9 +34,8 @@ REM Build executable
 pyinstaller --onefile ^
   --windowed ^
   --name VaultX ^
-  --add-data "data:data" ^
   --distpath ".\dist" ^
-  --buildpath ".\build" ^
+  --workpath ".\build" ^
   main.py
 
 if errorlevel 1 (
