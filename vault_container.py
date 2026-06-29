@@ -36,8 +36,6 @@ HEADER_TOTAL_FIXED = HEADER_MAGIC_SIZE + HEADER_VERSION_SIZE + HEADER_SIZE_SIZE
 class VaultHeader:
     """Binary vault container header."""
 
-    magic: bytes = VXDB_MAGIC
-    version: int = VXDB_VERSION
     vault_uuid: bytes  # 16 bytes
     created_timestamp: int  # Unix timestamp
     last_password_change: int  # Unix timestamp
@@ -47,6 +45,8 @@ class VaultHeader:
     salt: bytes  # 32 bytes
     encrypted_mek: bytes  # Encrypted master encryption key
     metadata_offset: int  # Where encrypted metadata begins in the file
+    magic: bytes = VXDB_MAGIC
+    version: int = VXDB_VERSION
     reserved: bytes = b""  # Reserved for future use
 
     def serialize(self) -> bytes:
@@ -125,8 +125,6 @@ class VaultHeader:
         vault_uuid = data[offset : offset + 16]
 
         return VaultHeader(
-            magic=magic,
-            version=version,
             vault_uuid=vault_uuid,
             created_timestamp=created_ts,
             last_password_change=last_pwd_change,
@@ -136,6 +134,8 @@ class VaultHeader:
             salt=salt,
             encrypted_mek=encrypted_mek,
             metadata_offset=metadata_off,
+            magic=magic,
+            version=version,
         )
 
 
