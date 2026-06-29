@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Optional
 
 from vault_container import VaultContainer
+
+LOGGER = logging.getLogger(__name__)
 
 
 class PasswordManager:
@@ -36,7 +39,8 @@ class PasswordManager:
         try:
             self.container.create(password)
             return True
-        except Exception:
+        except Exception as exc:
+            LOGGER.error("Vault creation failed: %s", exc)
             return False
 
     def unlock_vault(self, password: str) -> bool:
@@ -48,7 +52,8 @@ class PasswordManager:
         """
         try:
             return self.container.unlock(password)
-        except Exception:
+        except Exception as exc:
+            LOGGER.debug("Unlock failed: %s", exc)
             return False
 
     def is_unlocked(self) -> bool:

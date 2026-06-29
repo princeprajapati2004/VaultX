@@ -27,8 +27,8 @@ def detect_v3_vault() -> bool:
 
 def detect_legacy_v2_vault() -> bool:
     """Check if a legacy v2 vault exists."""
-    from constants import LEGACY_DATA_DIR
-    return LEGACY_DATA_DIR.exists() and LEGACY_CONFIG_FILE_V3.exists()
+    from constants import LEGACY_DATA_DIR, LEGACY_CONFIG_FILE
+    return LEGACY_DATA_DIR.exists() and LEGACY_CONFIG_FILE.exists()
 
 
 def migrate_v3_to_v4(password: str) -> bool:

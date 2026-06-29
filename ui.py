@@ -1339,6 +1339,10 @@ class VaultXApp(ctk.CTk):
 
             dialog.destroy()
 
+            if not self._session_password:
+                self._append_terminal_line("Session expired. Please unlock the vault again before importing.")
+                return
+
             def _on_import_error(exc: Exception) -> None:
                 if isinstance(exc, FileTooLarge):
                     self._append_terminal_line(f"Import blocked: {exc}")
@@ -1351,7 +1355,7 @@ class VaultXApp(ctk.CTk):
 
             self._run_backend_operation(
                 status_text="Importing files...",
-                task=lambda: import_files([file_path], self._session_password or ""),
+                task=lambda: import_files([file_path], self._session_password),
                 success_callback=lambda: self._append_terminal_line("Files imported successfully."),
                 error_callback=_on_import_error,
             )

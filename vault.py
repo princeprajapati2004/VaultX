@@ -13,9 +13,11 @@ from constants import (
     BACKUP_DIR,
     BACKUP_REMOVED,
     BACKUP_RESTORED,
+    ENCRYPTED_DIR,
     LOCK_FAILED,
     LOCKED_MESSAGE,
     MAX_FILE_SIZE,
+    METADATA_FILE,
     NO_VAULT_FOUND,
     RECOVERY_COMPLETE,
     RECOVERY_FAILED,
@@ -151,11 +153,14 @@ def lock_vault(password: str) -> None:
     if not unlocked():
         raise VaultNotFound(VAULT_FOLDER_NOT_FOUND)
 
-    # Use the cached MEK from unlock_vault
-    if not _CACHED_MEK:
+    # Verify password is correct by attempting to unlock the vault container
+    pm = PasswordManager(VAULT_CONTAINER_FILE)
+    if not pm.unlock_vault(password):
         raise InvalidPassword(WRONG_PASSWORD_OR_CORRUPTED)
 
-    master_key = _CACHED_MEK
+    master_key = pm.get_mek()
+    if not master_key:
+        raise InvalidPassword(WRONG_PASSWORD_OR_CORRUPTED)
 
     for d in (ENCRYPTED_DIR, TEMP_DIR, BACKUP_DIR):
         d.mkdir(parents=True, exist_ok=True)
@@ -164,6 +169,7 @@ def lock_vault(password: str) -> None:
     meta = VaultMetadata()
     temp_written: list[Path] = []
     backup_moved: list[Path] = []
+    committed_files: list[Path] = []
 
     try:
         # ── Phase 1: validate and encrypt every file to TEMP_DIR ─────────────
@@ -203,7 +209,9 @@ def lock_vault(password: str) -> None:
 
         # ── Phase 3: commit temp files → encrypted dir ───────────────────────
         for temp_path in temp_written:
-            temp_path.replace(ENCRYPTED_DIR / temp_path.name)
+            encrypted_path = ENCRYPTED_DIR / temp_path.name
+            temp_path.replace(encrypted_path)
+            committed_files.append(encrypted_path)
         temp_written.clear()
 
         # ── Phase 4: write encrypted metadata ───────────────────────────────
@@ -223,8 +231,14 @@ def lock_vault(password: str) -> None:
         # Rollback: remove any temp files not yet committed
         for tp in temp_written:
             tp.unlink(missing_ok=True)
-        # Restore backup if we already moved the original encrypted files
-        if backup_moved and not any(ENCRYPTED_DIR.glob("*.vx")):
+        # Rollback: remove any newly committed encrypted files
+        for committed_path in committed_files:
+            committed_path.unlink(missing_ok=True)
+        # Rollback: remove metadata file if it was written
+        if METADATA_FILE.exists():
+            METADATA_FILE.unlink(missing_ok=True)
+        # Restore backup if we moved the original encrypted files
+        if backup_moved:
             for bak in backup_moved:
                 if bak.exists():
                     bak.replace(ENCRYPTED_DIR / bak.name)
