@@ -52,6 +52,7 @@ LOGGER = logging.getLogger(__name__)
 
 _FAILED_ATTEMPTS: dict[str, tuple[float, int]] = {}
 _LOCKOUT_DURATION = 30
+_CACHED_MEK: bytes | None = None  # Master Encryption Key from unlocked vault
 
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
@@ -145,17 +146,16 @@ def lock_vault(password: str) -> None:
     Atomic: all new .vx files land in temp/ first, then are committed together.
     Existing encrypted files are backed up before the commit and restored on failure.
     """
+    global _CACHED_MEK
+
     if not unlocked():
         raise VaultNotFound(VAULT_FOLDER_NOT_FOUND)
 
-    # Unlock vault container to get Master Encryption Key
-    pm = PasswordManager(VAULT_CONTAINER_FILE)
-    if not pm.unlock_vault(password):
+    # Use the cached MEK from unlock_vault
+    if not _CACHED_MEK:
         raise InvalidPassword(WRONG_PASSWORD_OR_CORRUPTED)
 
-    master_key = pm.get_mek()
-    if not master_key:
-        raise InvalidPassword(WRONG_PASSWORD_OR_CORRUPTED)
+    master_key = _CACHED_MEK
 
     for d in (ENCRYPTED_DIR, TEMP_DIR, BACKUP_DIR):
         d.mkdir(parents=True, exist_ok=True)
@@ -215,6 +215,7 @@ def lock_vault(password: str) -> None:
         LOGGER.info(BACKUP_REMOVED)
 
         shutil.rmtree(VAULT_DIR)
+        _CACHED_MEK = None  # Clear cached MEK after successful lock
         LOGGER.info(LOCKED_MESSAGE)
 
     except Exception as exc:
@@ -291,6 +292,8 @@ def unlock_vault(password: str) -> None:
             raise CorruptedVault(WRONG_PASSWORD_OR_CORRUPTED) from exc
 
         _reset_rate_limit("unlock")
+        global _CACHED_MEK
+        _CACHED_MEK = master_key
         LOGGER.info(UNLOCKED_MESSAGE)
 
     except (InvalidPassword, CorruptedVault, MetadataCorrupted) as exc:
