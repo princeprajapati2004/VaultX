@@ -21,6 +21,9 @@ VAULT_DIR = ROOT_DIR / "Vault"
 # Encrypted files directory (beside executable in v4)
 ENCRYPTED_DIR = ROOT_DIR / "Encrypted"
 
+# Encrypted metadata file (stored in Encrypted directory)
+METADATA_FILE = ENCRYPTED_DIR / "metadata.json.vx"
+
 # AppData directories for runtime files (logs, temp, backup)
 APPDATA_DIR = Path.home() / "AppData" / "Local" / "VaultX"
 TEMP_DIR = APPDATA_DIR / "temp"

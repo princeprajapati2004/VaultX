@@ -156,6 +156,7 @@ def lock_vault(password: str) -> None:
     master_key = pm.get_mek()
     if not master_key:
         raise InvalidPassword(WRONG_PASSWORD_OR_CORRUPTED)
+
     for d in (ENCRYPTED_DIR, TEMP_DIR, BACKUP_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
