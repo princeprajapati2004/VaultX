@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import logging
 import shutil
+import time
 
 from cryptography.fernet import InvalidToken
 
 from archive import bytes_to_folder, folder_to_bytes, is_valid_zip_bytes
-from config import get_salt
+from config import get_salt, verify_password
 from constants import (
     BACKUP_CREATED,
     BACKUP_REMOVED,
@@ -34,6 +35,34 @@ from exceptions import CorruptedVault, InvalidPassword, VaultLocked, VaultNotFou
 from crypto import decrypt_bytes, encrypt_bytes
 
 LOGGER = logging.getLogger(__name__)
+
+_FAILED_ATTEMPTS = {}
+_LOCKOUT_DURATION = 5
+
+
+def _check_rate_limit(attempt_key: str = "unlock") -> None:
+    """Enforce rate limiting on failed authentication attempts."""
+
+    now = time.time()
+
+    if attempt_key in _FAILED_ATTEMPTS:
+        failed_time, count = _FAILED_ATTEMPTS[attempt_key]
+        elapsed = now - failed_time
+
+        if count >= 5 and elapsed < _LOCKOUT_DURATION:
+            raise InvalidPassword(f"Too many failed attempts. Try again in {int(_LOCKOUT_DURATION - elapsed)} seconds.")
+
+        if elapsed >= _LOCKOUT_DURATION:
+            del _FAILED_ATTEMPTS[attempt_key]
+
+    _FAILED_ATTEMPTS[attempt_key] = (now, _FAILED_ATTEMPTS.get(attempt_key, (now, 0))[1] + 1)
+
+
+def _reset_rate_limit(attempt_key: str = "unlock") -> None:
+    """Clear failed attempt tracking on successful authentication."""
+
+    if attempt_key in _FAILED_ATTEMPTS:
+        del _FAILED_ATTEMPTS[attempt_key]
 
 
 def vault_exists() -> bool:
@@ -211,6 +240,11 @@ def unlock_vault(password: str) -> None:
         raise VaultNotFound(NO_VAULT_FOUND)
 
     try:
+        _check_rate_limit("unlock")
+
+        if not verify_password(password):
+            raise InvalidPassword(WRONG_PASSWORD_OR_CORRUPTED)
+
         encrypted = VAULT_FILE.read_bytes()
         LOGGER.info("Decrypting.")
         decrypted = _verify_encrypted_archive(encrypted, password)
@@ -224,6 +258,7 @@ def unlock_vault(password: str) -> None:
                 shutil.rmtree(VAULT_DIR)
             raise CorruptedVault(WRONG_PASSWORD_OR_CORRUPTED) from exc
 
+        _reset_rate_limit("unlock")
         LOGGER.info(UNLOCKED_MESSAGE)
 
     except (InvalidPassword, CorruptedVault) as exc:

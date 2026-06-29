@@ -41,6 +41,28 @@ def save_new_password(password: str) -> None:
         json.dump(config, file_handle, indent=4)
 
 
+def verify_password(password: str) -> bool:
+    """Verify the password against the stored hash using constant-time comparison."""
+
+    if not CONFIG_FILE.exists():
+        return False
+
+    try:
+        with CONFIG_FILE.open("r", encoding="utf-8") as file_handle:
+            config = json.load(file_handle)
+
+        stored_hash = config.get("password_hash")
+        salt = config.get("salt")
+
+        if not stored_hash or not salt:
+            return False
+
+        derived_hash = derive_key(password, salt)
+        return secrets.compare_digest(derived_hash, stored_hash)
+    except (json.JSONDecodeError, KeyError, ValueError):
+        return False
+
+
 def get_salt() -> str:
     """Load the stored salt from the configuration file."""
 

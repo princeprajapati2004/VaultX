@@ -310,6 +310,8 @@ class VaultXApp(ctk.CTk):
     def _close(self) -> None:
         """Close the application cleanly."""
 
+        self._clear_password_fields()
+        self._session_password = None
         self.destroy()
 
     def _clear_view(self) -> None:
@@ -622,7 +624,20 @@ class VaultXApp(ctk.CTk):
         """Store the new master password and show the completion screen."""
 
         self._session_password = password
+        self._clear_password_fields()
         self._show_setup_complete_screen()
+
+    def _clear_password_fields(self) -> None:
+        """Clear password fields from memory after use."""
+
+        for widget_name in ("_setup_password_entry", "_setup_confirm_entry", "_password_entry"):
+            widget = getattr(self, widget_name, None)
+            if widget is not None and hasattr(widget, "delete"):
+                try:
+                    if widget.winfo_exists():
+                        widget.delete(0, "end")
+                except Exception:
+                    pass
 
     def _show_setup_complete_screen(self) -> None:
         """Render the setup completion screen."""
@@ -865,6 +880,7 @@ class VaultXApp(ctk.CTk):
         """Transition to the terminal after unlocking."""
 
         self._session_password = password
+        self._clear_password_fields()
         self._show_terminal_screen()
 
     def _show_terminal_screen(self) -> None:
@@ -1091,6 +1107,7 @@ class VaultXApp(ctk.CTk):
     def _on_lock_success(self) -> None:
         """Return to the login screen after a successful lock."""
 
+        self._clear_password_fields()
         self._session_password = None
         self._show_login_screen()
 
