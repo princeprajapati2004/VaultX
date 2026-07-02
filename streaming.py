@@ -22,6 +22,7 @@ CHUNKS  (repeated until EOF):
 from __future__ import annotations
 
 import hashlib
+import hmac
 import struct
 import zlib
 from pathlib import Path
@@ -162,7 +163,7 @@ def decrypt_file(
             dst.write(plaintext)
             chunk_index += 1
 
-    if expected_sha256 and hasher.hexdigest() != expected_sha256:
+    if expected_sha256 and not hmac.compare_digest(hasher.hexdigest(), expected_sha256):
         raise CorruptedVault(
             f"SHA-256 mismatch for {source_path.name}. "
             "The decrypted content does not match the stored checksum."

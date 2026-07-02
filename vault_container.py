@@ -76,12 +76,15 @@ class VaultHeader:
         data += struct.pack("<I", self.metadata_offset)  # Metadata offset
         data += vault_uuid  # Vault UUID (16 bytes)
 
-        # Calculate and prepend actual header size
+        # Calculate and prepend actual header size.
+        # data already contains magic(4) + version(2) + all fields.
+        # The final header prepends a 2-byte size field between version and the
+        # field data, so the total grows by 2.
         header_size = len(data) + 2  # +2 for the size field itself
-        header = struct.pack("<4s", self.magic)  # Magic
-        header += struct.pack("<H", self.version)  # Version
-        header += struct.pack("<H", header_size)  # Header size
-        header += data[4 + 2 + 2:]  # Rest of data (skip magic, version, size we already added)
+        header = struct.pack("<4s", self.magic)  # Magic (4)
+        header += struct.pack("<H", self.version)  # Version (2)
+        header += struct.pack("<H", header_size)  # Header size (2)
+        header += data[4 + 2:]  # Fields after magic+version (skip the 6 bytes already re-emitted)
 
         return header
 
@@ -123,6 +126,17 @@ class VaultHeader:
         metadata_off = struct.unpack("<I", data[offset : offset + 4])[0]
         offset += 4
         vault_uuid = data[offset : offset + 16]
+
+        # Reject headers with Argon2 params outside sane bounds so an attacker
+        # cannot weaken the KDF by modifying the .vxdb file.
+        if not (1 <= arg2_time <= 1000):
+            raise ValueError(f"Argon2id time_cost out of range: {arg2_time}")
+        if not (8 <= arg2_mem <= 4 * 1024 * 1024):  # 8 KiB … 4 GiB
+            raise ValueError(f"Argon2id memory_cost out of range: {arg2_mem}")
+        if not (1 <= arg2_par <= 64):
+            raise ValueError(f"Argon2id parallelism out of range: {arg2_par}")
+        if len(salt) < 16:
+            raise ValueError(f"Salt too short: {len(salt)} bytes")
 
         return VaultHeader(
             vault_uuid=vault_uuid,
@@ -231,7 +245,7 @@ class VaultContainer:
 
         # Attempt to decrypt MEK
         encrypted_data = self.header.encrypted_mek
-        if len(encrypted_data) < 24 + 32:  # nonce (24) + encrypted_mek (32) + tag (16)
+        if len(encrypted_data) < 24 + 32 + 16:  # nonce (24) + ciphertext (32) + Poly1305 tag (16)
             return False
 
         nonce = encrypted_data[:24]
@@ -246,6 +260,7 @@ class VaultContainer:
     def change_password(self, old_password: str, new_password: str) -> bool:
         """
         Change vault password without re-encrypting files.
+        Generates a fresh Argon2id salt and writes atomically.
         Returns True if successful.
         """
         if not self.unlock(old_password):
@@ -254,24 +269,29 @@ class VaultContainer:
         if not self.mek:
             return False
 
-        # Derive new KEK from new password using same salt
+        # Generate a NEW salt so the old KEK cannot be reused
+        new_salt = secrets.token_bytes(32)
+
         new_kek = derive_master_key(
             new_password,
-            self.header.salt,
+            new_salt,
             time_cost=self.header.argon2_time_cost,
             memory_cost=self.header.argon2_memory_cost,
             parallelism=self.header.argon2_parallelism,
         )
 
-        # Re-encrypt MEK with new KEK using new nonce
+        # Re-encrypt MEK with new KEK using a fresh nonce
         new_nonce = generate_nonce()
         new_encrypted_mek_with_tag = encrypt_chunk(self.mek, new_kek, new_nonce)
+        self.header.salt = new_salt
         self.header.encrypted_mek = new_nonce + new_encrypted_mek_with_tag
         self.header.last_password_change = int(time.time())
 
-        # Write updated header
+        # Atomic write: write to .tmp then rename so a crash cannot corrupt the vault
         header_bytes = self.header.serialize()
-        self.vault_path.write_bytes(header_bytes)
+        tmp_path = self.vault_path.with_suffix(".tmp")
+        tmp_path.write_bytes(header_bytes)
+        tmp_path.replace(self.vault_path)
 
         return True
 

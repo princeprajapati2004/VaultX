@@ -37,11 +37,16 @@ def save_new_password(password: str) -> None:
     - Encrypted/ directory for encrypted files
     - AppData structure for logs/temp/backup
     """
+    # Clean up any previous failed vault creation attempt
+    if VAULT_CONTAINER_FILE.exists():
+        VAULT_CONTAINER_FILE.unlink()
+
     _create_vault_directories()
 
     # Create vault container
     pm = PasswordManager(VAULT_CONTAINER_FILE)
-    pm.create_vault(password)
+    if not pm.create_vault(password):
+        raise RuntimeError("Failed to create vault container.")
 
 
 def verify_password(password: str) -> bool:
@@ -81,3 +86,15 @@ def is_legacy_vault() -> bool:
     legacy_v2 = LEGACY_CONFIG_FILE.exists()
     legacy_v3 = detect_v3_vault()
     return legacy_v2 or legacy_v3
+
+
+def reset_vault() -> None:
+    """Completely remove all vault files and directories (dangerous - use for recovery only)."""
+    import shutil
+
+    for path in (VAULT_CONTAINER_FILE, ENCRYPTED_DIR, VAULT_DIR, TEMP_DIR, BACKUP_DIR):
+        if path.exists():
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)

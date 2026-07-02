@@ -115,9 +115,25 @@ def _import_single_file(source: Path) -> None:
 
 
 def _import_directory(source: Path) -> None:
-    """Copy a directory tree into Vault/, renaming on conflict."""
+    """Copy a directory tree into Vault/ after validating every file inside."""
+    # Walk tree first so we can reject the whole import before writing anything
+    for child in source.rglob("*"):
+        if child.is_symlink():
+            raise UnsupportedFile(f"Symbolic link inside directory not allowed: {child.name}")
+        if child.is_file():
+            size = child.stat().st_size
+            if size > MAX_FILE_SIZE:
+                mb = size // (1024 * 1024)
+                raise FileTooLarge(
+                    f"'{child.name}' is {mb} MB and exceeds the 150 MB limit."
+                )
+            if child.suffix.lower() in _BLOCKED_EXTENSIONS:
+                raise UnsupportedFile(
+                    f"Executable file type '{child.suffix}' inside directory is not allowed."
+                )
+
     dest = _unique_destination(VAULT_DIR / source.name)
-    shutil.copytree(source, dest)
+    shutil.copytree(source, dest, symlinks=False)
     LOGGER.info("Imported directory: %s → %s", source.name, dest.name)
 
 

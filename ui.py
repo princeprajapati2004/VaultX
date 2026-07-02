@@ -228,13 +228,13 @@ class PromptDialog(ctk.CTkToplevel):
         self.destroy()
 
     def _submit(self) -> None:
-        primary = self.primary_entry.get().strip()
+        primary = self.primary_entry.get()
         if not primary:
             self.error_label.configure(text="Password required.")
             return
 
         if self._show_confirm:
-            confirm = self.confirm_entry.get().strip() if self.confirm_entry else ""
+            confirm = self.confirm_entry.get() if self.confirm_entry else ""
             if primary != confirm:
                 self.error_label.configure(text=PASSWORDS_DO_NOT_MATCH)
                 return
@@ -418,6 +418,14 @@ class VaultXApp(ctk.CTk):
 
         if recovery_pending():
             self._show_recovery_dialog()
+            # Re-bootstrap after recovery completes (vault state may have changed)
+            self.after(300, self._bootstrap_state)
+            return
+
+        # SECURITY CHECK: Detect unauthorized Vault folder (exists without Private.vxdb)
+        if VAULT_DIR.exists() and not VAULT_CONTAINER_FILE.exists():
+            self._show_unauthorized_vault_error()
+            return
 
         # Check if vault file exists and is valid
         vault_file_exists = False
@@ -443,6 +451,87 @@ class VaultXApp(ctk.CTk):
             return
 
         self._show_login_screen(error_message=NO_VAULT_FOUND)
+
+    def _show_unauthorized_vault_error(self) -> None:
+        """Render error when Vault folder exists without encryption container."""
+
+        frame = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
+        self._set_view(frame)
+
+        card = ctk.CTkFrame(
+            frame,
+            fg_color=PANEL,
+            corner_radius=18,
+            border_width=1,
+            border_color=BORDER,
+        )
+        card.place(relx=0.5, rely=0.5, anchor="center", relwidth=0.65, relheight=0.7)
+
+        title = ctk.CTkLabel(
+            card,
+            text="VaultX",
+            text_color=ERROR,
+            font=("Consolas", 28, "bold"),
+        )
+        title.pack(pady=(32, 4))
+
+        subtitle = ctk.CTkLabel(
+            card,
+            text="Security Error",
+            text_color=ERROR,
+            font=("Consolas", 18, "bold"),
+        )
+        subtitle.pack(pady=(0, 16))
+
+        message = ctk.CTkLabel(
+            card,
+            text="A Vault folder exists but the vault container (Private.vxdb) is missing.\n\n"
+                 "This could mean:\n"
+                 "• Files are unencrypted (security risk)\n"
+                 "• Vault was created outside the app\n"
+                 "• Vault files were partially deleted\n\n"
+                 "To proceed, you must delete or rename the Vault folder.",
+            text_color=MUTED,
+            font=("Consolas", 11),
+            justify="center",
+            wraplength=500,
+        )
+        message.pack(pady=(0, 24), padx=36)
+
+        button_row = ctk.CTkFrame(card, fg_color=PANEL)
+        button_row.pack(fill="x", padx=36, pady=(0, 20))
+
+        delete_button = ctk.CTkButton(
+            button_row,
+            text="Delete Vault Folder",
+            fg_color="#8B0000",
+            hover_color="#A52A2A",
+            text_color=TEXT,
+            font=("Consolas", 12, "bold"),
+            height=40,
+            command=self._delete_unsafe_vault,
+        )
+        delete_button.pack(fill="x", pady=(0, 12))
+
+        info = ctk.CTkLabel(
+            card,
+            text="After deletion, you can create a new secure vault.",
+            text_color=MUTED,
+            font=("Consolas", 10),
+        )
+        info.pack(pady=(0, 10))
+
+    def _delete_unsafe_vault(self) -> None:
+        """Delete the unsafe Vault folder and restart."""
+        import shutil
+
+        try:
+            if VAULT_DIR.exists():
+                shutil.rmtree(VAULT_DIR)
+            self._bootstrap_state()
+        except Exception as exc:
+            logging.error("Failed to delete Vault folder: %s", exc)
+            self._show_unauthorized_vault_error()
 
     def _show_legacy_notice(self) -> None:
         """Render a migration notice when a legacy v2 vault is detected."""
@@ -678,8 +767,8 @@ class VaultXApp(ctk.CTk):
     def _submit_setup_password(self) -> None:
         """Validate the first-time password and create the vault config."""
 
-        password = self._setup_password_entry.get().strip()
-        confirm = self._setup_confirm_entry.get().strip()
+        password = self._setup_password_entry.get()
+        confirm = self._setup_confirm_entry.get()
 
         if len(password) < MIN_PASSWORD_LENGTH:
             self._setup_error.configure(
@@ -690,6 +779,14 @@ class VaultXApp(ctk.CTk):
 
         if password != confirm:
             self._setup_error.configure(text=PASSWORDS_DO_NOT_MATCH, text_color=ERROR)
+            return
+
+        # Safety check: ensure clean state before creating new vault
+        if VAULT_DIR.exists() and not VAULT_CONTAINER_FILE.exists():
+            self._setup_error.configure(
+                text="Unsafe Vault folder detected. Use reset_vault.py to clean up.",
+                text_color=ERROR,
+            )
             return
 
         self._run_backend_operation(
@@ -776,6 +873,11 @@ class VaultXApp(ctk.CTk):
         password = self._session_password
         if not password:
             self._show_login_screen()
+            return
+
+        # Verify the vault file was created
+        if not VAULT_CONTAINER_FILE.exists():
+            self._show_setup_password_screen("Vault creation failed. Please try again.")
             return
 
         self._run_backend_operation(
@@ -932,7 +1034,7 @@ class VaultXApp(ctk.CTk):
     def _submit_login(self) -> None:
         """Unlock the vault using the login password."""
 
-        password = self._password_entry.get().strip()
+        password = self._password_entry.get()
         if not password:
             self._login_error.configure(text="Invalid password.", text_color=ERROR)
             return
@@ -1197,7 +1299,7 @@ class VaultXApp(ctk.CTk):
 
         self._clear_password_fields()
         self._session_password = None
-        self._show_login_screen()
+        self._show_login_screen(error_message="✓ Vault locked successfully.")
 
     def _handle_setup_error(self, exc: Exception) -> None:
         """Display a setup error and keep the wizard active."""
@@ -1212,71 +1314,81 @@ class VaultXApp(ctk.CTk):
     def _handle_lock_error(self, exc: Exception) -> None:
         """Display a lock error message."""
 
-        if isinstance(exc, (VaultLocked, VaultNotFound, CorruptedVault, FileTooLarge)):
+        if isinstance(exc, InvalidPassword):
+            message = "Wrong password. Lock cancelled."
+        elif isinstance(exc, (VaultLocked, VaultNotFound, CorruptedVault, FileTooLarge)):
             message = str(exc)
         elif isinstance(exc, UnsupportedFile):
             message = str(exc)
         else:
             message = "Unable to lock vault."
 
-        self._append_terminal_line(message)
         self._show_terminal_screen()
+        self._append_terminal_line("")
+        self._append_terminal_line(f"✗ Error: {message}")
+        self._append_terminal_line("")
 
     def _request_password_change(self) -> None:
-        """Ask for a new master password and re-encrypt the vault."""
+        """Ask for current password then new password, then update on background thread."""
 
-        dialog = PromptDialog(
+        # Both dialogs MUST run on the main thread before dispatching to a worker.
+        current_dialog = PromptDialog(
+            self,
+            title="Verify Identity",
+            label="Enter current password",
+            show_confirm=False,
+        )
+        if not isinstance(current_dialog.result, str):
+            self._append_terminal_line("Password change cancelled.")
+            return
+        old_password = current_dialog.result
+
+        new_dialog = PromptDialog(
             self,
             title="Change Password",
             label="Enter new password",
             confirm_label="Confirm new password",
             show_confirm=True,
         )
-        if not isinstance(dialog.result, str):
+        if not isinstance(new_dialog.result, str):
             self._append_terminal_line("Password change cancelled.")
             return
+        new_password = new_dialog.result
 
-        new_password = dialog.result
         self._run_backend_operation(
             status_text="Updating password...",
-            task=lambda: self._change_password(new_password),
-            success_callback=lambda: self._append_terminal_line("Password updated."),
+            task=lambda: self._do_change_password(old_password, new_password),
+            success_callback=lambda: self._on_password_change_success(new_password),
             error_callback=self._handle_password_change_error,
         )
 
-    def _change_password(self, new_password: str) -> None:
-        """Change the vault password without re-encrypting files (v4 instant change)."""
+    def _do_change_password(self, old_password: str, new_password: str) -> None:
+        """Background-thread worker: re-encrypt MEK with new password."""
         from password_manager import PasswordManager
 
-        # Prompt for current password to verify identity
-        dialog = PromptDialog(
-            self,
-            title="Verify Password",
-            label="Enter current password",
-            show_confirm=False,
-        )
-        if not isinstance(dialog.result, str):
-            raise ValueError("Password change cancelled")
-
-        old_password = dialog.result
-
-        # Perform instant password change (no file re-encryption needed)
         pm = PasswordManager(VAULT_CONTAINER_FILE)
         if not pm.change_password(old_password, new_password):
-            raise ValueError("Current password is incorrect")
+            raise InvalidPassword("Current password is incorrect")
+
+    def _on_password_change_success(self, new_password: str) -> None:
+        """Update the cached session password and notify the user."""
+        self._session_password = new_password
+        self._append_terminal_line("Password changed successfully.")
 
     def _handle_password_change_error(self, exc: Exception) -> None:
         """Report password update failures."""
 
         if isinstance(exc, VaultError):
-            self._append_terminal_line(str(exc))
+            message = str(exc)
         else:
-            self._append_terminal_line("Unable to change password.")
+            message = "Unable to change password."
 
         if unlocked():
             self._show_terminal_screen()
+            self._append_terminal_line("")
+            self._append_terminal_line(f"✗ Error: {message}")
         else:
-            self._show_login_screen(error_message="Password updated. Unlock with the new password.")
+            self._show_login_screen(error_message=message)
 
     def _request_file_import(self) -> None:
         """Prompt for file path and import to vault."""

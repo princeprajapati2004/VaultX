@@ -65,15 +65,22 @@ def _check_rate_limit(attempt_key: str = "unlock") -> None:
     if attempt_key in _FAILED_ATTEMPTS:
         failed_time, count = _FAILED_ATTEMPTS[attempt_key]
         elapsed = now - failed_time
-        if count >= 5 and elapsed < _LOCKOUT_DURATION:
+        if elapsed >= _LOCKOUT_DURATION:
+            # Window expired — fresh start; don't increment yet (that happens below)
+            del _FAILED_ATTEMPTS[attempt_key]
+        elif count >= 5:
             remaining = int(_LOCKOUT_DURATION - elapsed)
             raise InvalidPassword(
                 f"Too many failed attempts. Try again in {remaining} seconds."
             )
-        if elapsed >= _LOCKOUT_DURATION:
-            del _FAILED_ATTEMPTS[attempt_key]
-    current_count = _FAILED_ATTEMPTS.get(attempt_key, (now, 0))[1]
-    _FAILED_ATTEMPTS[attempt_key] = (now, current_count + 1)
+
+    if attempt_key not in _FAILED_ATTEMPTS:
+        # First failure in this window — record the window start time
+        _FAILED_ATTEMPTS[attempt_key] = (now, 1)
+    else:
+        # Subsequent failure — keep the ORIGINAL timestamp so the window doesn't reset
+        failed_time, count = _FAILED_ATTEMPTS[attempt_key]
+        _FAILED_ATTEMPTS[attempt_key] = (failed_time, count + 1)
 
 
 def _reset_rate_limit(attempt_key: str = "unlock") -> None:
@@ -89,8 +96,15 @@ def vault_exists() -> bool:
 
 
 def unlocked() -> bool:
-    """Return True when the plaintext Vault/ working directory exists."""
-    return VAULT_DIR.exists()
+    """Return True when vault is properly unlocked (has both container and plaintext files).
+
+    SECURITY: Both conditions must be true:
+    1. Private.vxdb must exist (vault container file)
+    2. Vault/ must exist (decrypted files)
+
+    If Vault/ exists without Private.vxdb, this is an error state (unauthorized vault).
+    """
+    return vault_exists() and VAULT_DIR.exists()
 
 
 def recovery_pending() -> bool:
@@ -191,9 +205,11 @@ def lock_vault(password: str) -> None:
             )
             temp_written.append(temp_path)
 
+            # Store the POSIX relative path so subdirectory structure is preserved
+            rel_name = file_path.relative_to(VAULT_DIR).as_posix()
             record = build_file_record(
                 file_id=file_id,
-                original_name=file_path.name,
+                original_name=rel_name,
                 plaintext_path=file_path,
                 sha256=sha256_hex,
                 compressed=was_compressed,
@@ -290,7 +306,9 @@ def unlock_vault(password: str) -> None:
                         f"Encrypted file missing from vault: {record.encrypted_name}"
                     )
 
-                dest_path = _unique_path(VAULT_DIR / record.original_name)
+                dest_base = VAULT_DIR / record.original_name
+                dest_base.parent.mkdir(parents=True, exist_ok=True)
+                dest_path = _unique_path(dest_base)
                 LOGGER.info("Decrypting: %s", record.original_name)
                 decrypt_file(
                     vx_path,
